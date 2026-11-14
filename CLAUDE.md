@@ -19,22 +19,59 @@ Context engineering is the discipline of curating everything that enters a model
 - `.claude-plugin/marketplace.json` - Claude Code marketplace manifest (single bundled plugin, v2.6.0)
 - `.plugin/plugin.json` - Open Plugins format manifest (v2.6.0)
 
+## Setup
+
+```
+python3 -m pip install -r requirements-dev.txt   # pyyaml, skills-ref, jsonschema, referencing
+```
+
+CI uses Python 3.12 and Node 22. Python 3.13 also works locally. No top-level build system; repo-level gates and per-project tooling below.
+
 ## Build & Test Commands
 
-No top-level build system. Repo-level gates and per-project tooling below.
+### Fast pre-commit gate set (all run in CI on every push to main and every PR)
 
-### Top-level deterministic gates (run on every PR via CI)
+All of these finish in seconds, except the unit tests (about 10 s). Run them from the repo root:
 
 ```
-python3 -m unittest researcher.scripts.tests.test_skill_frontmatter # parser and strict-YAML regression tests
-python3 researcher/scripts/validate_governance.py --check # authority model and generated view
-python3 researcher/scripts/build_inventory.py --check    # corpus references and generated inventory
+python3 -m unittest discover -s researcher/scripts/tests -p 'test_*.py'   # all researcher unit tests
+python3 researcher/scripts/validate_governance.py --check     # authority model and generated view
+python3 researcher/scripts/build_inventory.py --check         # corpus references and generated inventory
+python3 researcher/scripts/validate_export.py check --staging-dir researcher/exports/examples/restricted-citation-v1  # public export boundary
+python3 researcher/scripts/validate_schemas.py --check        # Python schema contract
+python3 researcher/scripts/migrate_legacy.py --dry-run        # artifact contract migration
 python3 researcher/scripts/validate_platform_compat.py --require-reference-validator # Agent Skills reference validator + Cursor/Claude/Codex install-layout simulation
-python3 researcher/scripts/validate_repo.py --strict       # corpus structure, manifests, rubric math, mechanism registry, claims, corpus index, activation cases, benchmark scenarios, run artifacts
+python3 researcher/scripts/validate_repo.py --strict          # corpus structure, manifests, rubric math, mechanism registry, claims, corpus index, activation cases, benchmark scenarios, run artifacts
 python3 researcher/scripts/skill_health.py --strict --no-history  # deterministic skill-body quality gate
-python3 researcher/scripts/run_benchmarks.py               # adversarial benchmark harness + repo + activation gates
-python3 researcher/scripts/check_activation_cases.py       # skill-boundary regression fixtures
+python3 researcher/scripts/check_activation_cases.py          # skill-boundary regression fixtures
+python3 researcher/scripts/run_benchmarks.py                  # adversarial benchmark harness + repo + activation gates
 ```
+
+When a `--check` gate fails because generated files are stale, regenerate them with the same script and `--write` (`build_inventory.py`, `validate_governance.py`, `validate_schemas.py`) and commit the regenerated files under `researcher/corpus/`, `researcher/generated/`, `governance/generated/`, or `researcher/schemas/generated/`. Never hand-edit generated files.
+
+CI also runs `python -m py_compile` on every script in `researcher/scripts/`. When you add a new script or test, add it to the compile list in `.github/workflows/validate.yml`.
+
+### TypeScript checks in CI
+
+```
+cd researcher/schemas/typescript && npm ci --ignore-scripts && npm run typecheck && npm test
+cd researcher/benchmarks/sdk-runner && npm ci --ignore-scripts && npm run typecheck
+npm run router:dry-run -- --models gpt-5.5 --reps 1 --max-runs 118 --max-budget-usd 2        # from sdk-runner/
+npm run effectiveness:dry-run -- --models gpt-5.5 --reps 1 --max-runs 12 --max-budget-usd 2  # from sdk-runner/
+```
+
+Dry runs make no SDK calls. `router:run` and `effectiveness:run` call a paid API: never run them without explicit user approval and cost gates (see AGENTS.md).
+
+If you add a router benchmark prompt or a skill, the router `--max-runs 118` cap in CI may need raising.
+
+### Long-horizon prompt lab (examples/long-horizon-prompt-lab)
+
+```
+python3 examples/long-horizon-prompt-lab/scripts/build_lab.py
+python3 examples/long-horizon-prompt-lab/scripts/validate_site.py
+```
+
+CI fails if the build changes `data/prompt-pairs.json`, `ui/data.js`, or `ui/prompts/`. After editing lab sources or the `long-horizon-prompting` rubric, rebuild and commit the outputs. `npm run serve` serves the site on port 8000. `.github/workflows/deploy-prompt-lab.yml` deploys it.
 
 ### Per-run readiness (active runs only)
 
@@ -54,14 +91,14 @@ researcher/orchestration/launchd/install.sh    # macOS daemon
 researcher/orchestration/launchd/uninstall.sh
 ```
 
-### Example projects
+### Example projects (not in CI)
 
 #### examples/llm-as-judge-skills (TypeScript, Node >= 18)
 ```
 cd examples/llm-as-judge-skills
 npm install
 npm run build        # tsc
-npm test             # vitest (19 tests)
+npm test             # vitest
 npm run lint         # eslint
 npm run format       # prettier
 npm run typecheck    # tsc --noEmit
@@ -83,6 +120,17 @@ npm run weekly-review
 npm run content-ideas
 npm run stale-contacts
 ```
+
+## Code Style
+
+- **Python scripts in `researcher/scripts/`**: stdlib first (only the packages in `requirements-dev.txt`), runnable as `python3 researcher/scripts/<name>.py` from the repo root. Tests use `unittest`, live in `researcher/scripts/tests/test_*.py`, and must not need network access or API keys.
+- **Shared files**: atomic writes (`tempfile` + `os.replace`) and `fcntl` locks for anything the loop touches.
+- **JSONL ledgers and registries** (`registry.jsonl`, `claims/index.jsonl`, `ledgers/*.jsonl`, `fixtures/activation-cases.jsonl`): append-only, one JSON object per line. Never rewrite or reorder past entries.
+- **YAML frontmatter**: quote any `description` that contains a colon, or strict parsers in Cursor, Claude Code, and Codex reject the skill.
+- **Heuristics**: no regex or keyword-list heuristics in skills or scripts. Use mechanism-level criteria, rubrics, and evidence-backed validation.
+- **Prose (skills, docs, README, CHANGELOG, PR bodies)**: technical CTO tone, direct and precise, trade-offs stated upfront. No marketing language, exclamation marks, emojis, or em dashes.
+- **CHANGELOG.md**: add every change under `## [Unreleased]`, grouped by `### Added` / `### Changed`, and list the corpus wiring it touched (mechanisms, claims, activation cases, regenerated files).
+- **Release version** lives in three places that must match: `.claude-plugin/marketplace.json`, `.plugin/plugin.json`, and root `SKILL.md`.
 
 ## Skill Authoring Rules
 
@@ -119,6 +167,18 @@ When working through the researcher operating system:
 All published skills are distributed as a single plugin (`context-engineering`) in the marketplace manifest. This avoids cache duplication: Claude Code caches each plugin's `source` directory separately, so multiple plugins pointing to `source: "./"` would each cache a full copy of the repo.
 
 Progressive disclosure pattern: only skill names/descriptions load at startup; full content loads on activation.
+
+## Git and PR Workflow
+
+- Work on a feature branch, never directly on `main`. CI validates every PR, including stacked PRs whose base is another proposal branch.
+- Run the fast gate set above before every commit that touches skills, `researcher/`, `governance/`, or manifests.
+- Never push, open a PR, or merge without explicit user approval for that specific action. Approval for one push does not cover the next.
+- Changes to `docs/specs/SPEC-000-program-constitution.md` or `governance/constitution.yaml` use the `.github/PULL_REQUEST_TEMPLATE/constitution-amendment.md` template.
+- Do not commit anything under `Private/`, `dashboard/`, `.cursor/`, or the runtime paths listed in `.gitignore`.
+
+## Workspace Memory
+
+`AGENTS.md` holds learned user preferences and workspace facts (benchmark stages, Cursor SDK cost rules, ledger event shape, API key handling). Read it before benchmark, ledger, or release work. Architecture decisions live in `docs/decisions/` and specs in `docs/specs/`.
 
 ## Key Design Principles
 
